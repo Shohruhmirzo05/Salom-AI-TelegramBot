@@ -40,12 +40,70 @@ python bot.py
 
 ## Docker Deployment
 
-You can also run the bot using Docker:
+### Local Development
 
 ```bash
+# Copy example env and configure
+cp .env.example .env
+# Edit .env with your TELEGRAM_TOKEN
+
+# Build and run with Docker
 docker build -t salom-ai-telegram-bot .
 docker run -d --env-file .env salom-ai-telegram-bot
+
+# Or use Docker Compose
+docker-compose up -d
 ```
+
+### Production Deployment (CI/CD)
+
+This repository includes automated CI/CD pipelines that deploy to the production server.
+
+#### GitHub Secrets Required
+
+Add these secrets to your GitHub repository (`Settings > Secrets and variables > Actions`):
+
+| Secret | Description |
+|--------|-------------|
+| `SSH_PRIVATE_KEY` | SSH private key for server access |
+| `SERVER_IP` | Production server IP (104.248.34.19) |
+| `SERVER_USER` | SSH user (root) |
+| `TELEGRAM_TOKEN` | *(Optional in secrets, can be set on server)* |
+
+#### Server Setup (One-time)
+
+On the production server, create the environment file:
+
+```bash
+# Create directory and env file
+mkdir -p /opt/salom-ai-telegram-bot
+cat > /opt/salom-ai-telegram-bot/.env.production << 'EOF'
+TELEGRAM_TOKEN=your_bot_token_here
+BACKEND_URL=http://salom-ai-api-1:8000
+DEFAULT_MODEL=gpt-4o-mini
+EOF
+```
+
+#### How It Works
+
+1. **CI Pipeline** (`.github/workflows/ci.yml`):
+   - Runs on all pushes and PRs
+   - Linting with flake8, black, isort
+   - Docker image build test
+   - Security vulnerability scanning
+
+2. **CD Pipeline** (`.github/workflows/cd.yml`):
+   - Runs on push to `main`/`master` branch
+   - Copies code to server via SSH
+   - Builds Docker image on server
+   - Connects container to `salom-ai_salom-network`
+   - Verifies deployment
+
+#### Docker Network
+
+The bot container joins the existing `salom-ai_salom-network` to communicate with:
+- `salom-ai-api-1` - Backend API (port 8000)
+- Other Salom AI services
 
 ## Features
 

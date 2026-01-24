@@ -29,6 +29,11 @@ bot.log
 # Data files (if sensitive)
 data/*.json
 data/*.db
+*.pickle
+bot_state.pickle
+
+# Production environment (contains secrets)
+.env.production
 
 # Distribution / packaging
 dist/

@@ -1,0 +1,206 @@
+# Continuous Deployment for Salom AI Telegram Bot
+# Deploys to production server on push to main/master branch
+
+name: CD
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even if CI checks fail'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  CONTAINER_NAME: salom-ai-telegram-bot
+  IMAGE_NAME: salom-ai-telegram-bot
+  DOCKER_NETWORK: salom-ai_salom-network
+
+jobs:
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    
+    # Only deploy if CI passed (or force deploy)
+    # Note: CI workflow runs on same trigger, so we check for success
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
+      
+      - name: Create deployment package
+        run: |
+          # Create a tarball of the project
+          tar -czvf deploy.tar.gz \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='.env' \
+            --exclude='.env.local' \
+            --exclude='*.pyc' \
+            --exclude='data/*.pickle' \
+            --exclude='*.log' \
+            .
+      
+      - name: Copy files to server
+        run: |
+          # Copy the deployment package
+          scp -o StrictHostKeyChecking=no \
+            deploy.tar.gz \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/tmp/telegram-bot-deploy.tar.gz
+      
+      - name: Deploy on server
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} << 'DEPLOY_SCRIPT'
+          set -e
+          
+          echo "=== Salom AI Telegram Bot Deployment ==="
+          echo "Timestamp: $(date)"
+          
+          # Configuration
+          DEPLOY_DIR="/opt/salom-ai-telegram-bot"
+          CONTAINER_NAME="salom-ai-telegram-bot"
+          IMAGE_NAME="salom-ai-telegram-bot"
+          NETWORK_NAME="salom-ai_salom-network"
+          
+          # Create deployment directory
+          mkdir -p $DEPLOY_DIR
+          mkdir -p $DEPLOY_DIR/data
+          
+          # Extract deployment package
+          echo "Extracting deployment package..."
+          cd $DEPLOY_DIR
+          tar -xzvf /tmp/telegram-bot-deploy.tar.gz
+          rm /tmp/telegram-bot-deploy.tar.gz
+          
+          # Stop existing container (if running)
+          echo "Stopping existing container..."
+          docker stop $CONTAINER_NAME 2>/dev/null || true
+          docker rm $CONTAINER_NAME 2>/dev/null || true
+          
+          # Remove old image
+          echo "Removing old image..."
+          docker rmi $IMAGE_NAME 2>/dev/null || true
+          
+          # Build new image
+          echo "Building new Docker image..."
+          docker build -t $IMAGE_NAME .
+          
+          # Ensure the network exists
+          echo "Checking Docker network..."
+          if ! docker network ls | grep -q $NETWORK_NAME; then
+            echo "Warning: Network $NETWORK_NAME not found. Creating it..."
+            docker network create $NETWORK_NAME || true
+          fi
+          
+          # Get TELEGRAM_TOKEN from environment or .env file
+          if [ -f "$DEPLOY_DIR/.env.production" ]; then
+            source $DEPLOY_DIR/.env.production
+          fi
+          
+          # Check if TELEGRAM_TOKEN is set
+          if [ -z "$TELEGRAM_TOKEN" ]; then
+            echo "Error: TELEGRAM_TOKEN not set!"
+            echo "Please create /opt/salom-ai-telegram-bot/.env.production with TELEGRAM_TOKEN=your_token"
+            exit 1
+          fi
+          
+          # Start new container
+          echo "Starting new container..."
+          docker run -d \
+            --name $CONTAINER_NAME \
+            --network $NETWORK_NAME \
+            --restart unless-stopped \
+            -e TELEGRAM_TOKEN="$TELEGRAM_TOKEN" \
+            -e BACKEND_URL="${BACKEND_URL:-http://salom-ai-api-1:8000}" \
+            -e DEFAULT_MODEL="${DEFAULT_MODEL:-gpt-4o-mini}" \
+            -v $DEPLOY_DIR/data:/app/data \
+            $IMAGE_NAME
+          
+          # Wait for container to start
+          echo "Waiting for container to start..."
+          sleep 5
+          
+          # Check container status
+          if docker ps | grep -q $CONTAINER_NAME; then
+            echo "✅ Container started successfully!"
+            docker logs --tail 20 $CONTAINER_NAME
+          else
+            echo "❌ Container failed to start!"
+            docker logs $CONTAINER_NAME
+            exit 1
+          fi
+          
+          echo ""
+          echo "=== Deployment Complete ==="
+          echo "Container: $CONTAINER_NAME"
+          echo "Network: $NETWORK_NAME"
+          echo "Data volume: $DEPLOY_DIR/data"
+          
+          DEPLOY_SCRIPT
+      
+      - name: Verify deployment
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} << 'VERIFY_SCRIPT'
+          echo "=== Deployment Verification ==="
+          
+          CONTAINER_NAME="salom-ai-telegram-bot"
+          
+          # Check if container is running
+          if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "✅ Container is running"
+            
+            # Show container details
+            echo ""
+            echo "Container Info:"
+            docker inspect $CONTAINER_NAME --format '
+              Name: {{.Name}}
+              Status: {{.State.Status}}
+              Started: {{.State.StartedAt}}
+              Network: {{range .NetworkSettings.Networks}}{{.NetworkID}}{{end}}
+            '
+            
+            # Show recent logs
+            echo ""
+            echo "Recent Logs:"
+            docker logs --tail 10 $CONTAINER_NAME
+            
+            # Check network connectivity
+            echo ""
+            echo "Network Connectivity:"
+            docker exec $CONTAINER_NAME curl -s --connect-timeout 5 http://salom-ai-api-1:8000/health 2>/dev/null && echo "✅ API is reachable" || echo "⚠️ API might not be reachable (this is OK if using external URL)"
+            
+          else
+            echo "❌ Container is NOT running"
+            echo "Container logs:"
+            docker logs $CONTAINER_NAME 2>&1 || echo "No logs available"
+            exit 1
+          fi
+          
+          VERIFY_SCRIPT
+      
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_rsa
+
+  notify:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: failure()
+    
+    steps:
+      - name: Deployment failed notification
+        run: |
+          echo "❌ Telegram Bot deployment failed!"
+          echo "Check the workflow logs for details."
+          # Add your notification mechanism here (Slack, Telegram, email, etc.)

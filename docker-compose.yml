@@ -1,0 +1,30 @@
+# Docker Compose for Salom AI Telegram Bot
+# Used for local development and testing
+# For production, the container is deployed via CD pipeline
+
+version: '3.8'
+
+services:
+  telegram-bot:
+    build: .
+    container_name: salom-ai-telegram-bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - BACKEND_URL=${BACKEND_URL:-http://host.docker.internal:8000}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-4o-mini}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}
+    volumes:
+      - ./data:/app/data
+    # For local development, connect to host network to reach local API
+    # Comment out for production (use external network instead)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # For production deployment, uncomment below to join the Salom AI network
+    # networks:
+    #   - salom-ai_salom-network
+
+    # For production, use external network
+    # networks:
+    #   salom-ai_salom-network:
+    #     external: true
