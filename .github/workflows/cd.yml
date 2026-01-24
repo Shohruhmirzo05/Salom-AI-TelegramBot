@@ -40,8 +40,9 @@ jobs:
       
       - name: Create deployment package
         run: |
-          # Create a tarball of the project (using POSIX format for compatibility)
-          tar --format=posix -czvf deploy.tar.gz \
+          # Create a tarball of the project
+          # Note: tar may return exit code 1 for "file changed as we read it" warning, which is OK
+          tar -czvf deploy.tar.gz \
             --exclude='.git' \
             --exclude='__pycache__' \
             --exclude='.env' \
@@ -51,7 +52,8 @@ jobs:
             --exclude='*.log' \
             --exclude='.DS_Store' \
             --exclude='._*' \
-            .
+            --exclude='deploy.tar.gz' \
+            . || [[ $? -eq 1 ]]
       
       - name: Copy files to server
         run: |
