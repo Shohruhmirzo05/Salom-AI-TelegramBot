@@ -62,29 +62,22 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: salom-ai-telegram-bot:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
       
-      - name: Test Docker image starts
+      - name: Test Docker image loads
         run: |
-          # Create a test env file
-          echo "TELEGRAM_TOKEN=test_token_for_ci" > .env.test
-          echo "BACKEND_URL=http://localhost:8000" >> .env.test
+          # Verify the image was built and can be inspected
+          docker images salom-ai-telegram-bot:test
           
-          # Start the container briefly to verify it initializes
-          docker run --rm -d \
-            --name test-bot \
-            --env-file .env.test \
+          # Test that the bot module can be imported
+          docker run --rm \
+            -e TELEGRAM_TOKEN=test_token_for_ci \
+            -e BACKEND_URL=http://localhost:8000 \
             salom-ai-telegram-bot:test \
-            sh -c "python -c 'import bot; print(\"Bot module loaded successfully\")'"
-          
-          # Wait a moment and check if it ran
-          sleep 5
-          docker logs test-bot 2>&1 || true
-          
-          # Cleanup (container should have stopped)
-          docker rm -f test-bot 2>/dev/null || true
+            python -c "import bot; print('✅ Bot module loaded successfully')"
 
   security:
     name: Security Check

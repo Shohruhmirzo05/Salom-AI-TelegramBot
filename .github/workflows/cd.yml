@@ -11,7 +11,7 @@ on:
       force_deploy:
         description: 'Force deployment even if CI checks fail'
         required: false
-        default: 'false'
+        default: false
         type: boolean
 
 env:
@@ -40,8 +40,8 @@ jobs:
       
       - name: Create deployment package
         run: |
-          # Create a tarball of the project
-          tar -czvf deploy.tar.gz \
+          # Create a tarball of the project (using POSIX format for compatibility)
+          tar --format=posix -czvf deploy.tar.gz \
             --exclude='.git' \
             --exclude='__pycache__' \
             --exclude='.env' \
@@ -49,6 +49,8 @@ jobs:
             --exclude='*.pyc' \
             --exclude='data/*.pickle' \
             --exclude='*.log' \
+            --exclude='.DS_Store' \
+            --exclude='._*' \
             .
       
       - name: Copy files to server
