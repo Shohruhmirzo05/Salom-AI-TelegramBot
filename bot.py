@@ -555,70 +555,104 @@ async def stream_chat_response(
     chat_id: int,
     message_id: int,
     payload: Dict[str, Any],
-    token: str,
+    state: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Stream chat response to Telegram with throttling to avoid rate limits."""
+    """Stream chat response to Telegram with throttling and auto-refresh on 401."""
     url = build_url("/chat/stream")
-    headers = {"Authorization": f"Bearer {token}"}
     
-    full_text = ""
-    buffer = ""
-    last_update_time = time.time()
-    result = {"conversation_id": None, "reply": ""}
-
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream("POST", url, json=payload, headers=headers) as response:
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
+    async def _stream(token: str) -> Optional[Dict[str, Any]]:
+        headers = {"Authorization": f"Bearer {token}"}
+        full_text = ""
+        buffer = ""
+        last_update_time = time.time()
+        result = {"conversation_id": None, "reply": ""}
+        
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream("POST", url, json=payload, headers=headers) as response:
                     
-                    try:
-                        line_content = line[6:].strip()
-                        if not line_content or line_content == "[DONE]":
-                            continue
-                            
-                        data = json.loads(line_content)
-                        event_type = data.get("type")
-                        
-                        if event_type == "chunk":
-                            content = data.get("content", "")
-                            if content:
-                                full_text += content
-                                buffer += content
-                                
-                                # Throttling: Update if buffer > 20 chars OR > 1.5 seconds passed
-                                current_time = time.time()
-                                if len(buffer) > 20 or (current_time - last_update_time) > 1.5:
-                                    try:
-                                        await bot.edit_message_text(
-                                            chat_id=chat_id,
-                                            message_id=message_id,
-                                            text=full_text + " ▌",
-                                            parse_mode=None  # Plain text while streaming
-                                        )
-                                        buffer = ""
-                                        last_update_time = current_time
-                                    except RetryAfter as e:
-                                        await asyncio.sleep(e.retry_after)
-                                    except Exception:
-                                        pass  # Ignore other edit errors (e.g. content not modified)
-                                        
-                        elif event_type == "done":
-                            result["conversation_id"] = data.get("conversation_id")
-                            
-                        elif event_type == "error":
-                            result["error"] = data.get("message")
-                            
-                    except json.JSONDecodeError:
-                        continue
-    except Exception as e:
-        logger.error(f"Stream error: {e}")
-        full_text += f"\n\n[Xatolik: {str(e)}]"
+                    # Check for 401 immediately
+                    if response.status_code == 401:
+                        return None # Signal need to refresh
 
-    # Final update
+                    if response.status_code != 200:
+                        error_msg = await response.read()
+                        result["error"] = f"HTTP {response.status_code}: {error_msg.decode('utf-8')}"
+                        return result
+
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        
+                        try:
+                            line_content = line[6:].strip()
+                            if not line_content or line_content == "[DONE]":
+                                continue
+                                
+                            data = json.loads(line_content)
+                            event_type = data.get("type")
+                            
+                            if event_type == "chunk":
+                                content = data.get("content", "")
+                                if content:
+                                    full_text += content
+                                    buffer += content
+                                    
+                                    # Throttling
+                                    current_time = time.time()
+                                    if len(buffer) > 20 or (current_time - last_update_time) > 1.5:
+                                        try:
+                                            await bot.edit_message_text(
+                                                chat_id=chat_id,
+                                                message_id=message_id,
+                                                text=full_text + " ▌",
+                                                parse_mode=None
+                                            )
+                                            buffer = ""
+                                            last_update_time = current_time
+                                        except RetryAfter as e:
+                                            await asyncio.sleep(e.retry_after)
+                                        except Exception:
+                                            pass
+                                            
+                            elif event_type == "done":
+                                result["conversation_id"] = data.get("conversation_id")
+                                
+                            elif event_type == "error":
+                                result["error"] = data.get("message")
+                                
+                        except json.JSONDecodeError:
+                            continue
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+            full_text += f"\n\n[Xatolik: {str(e)}]"
+            result["error"] = str(e) # Capture error
+
+        result["reply"] = full_text
+        return result
+
+    # First attempt
+    current_token = state.get("access_token")
+    data = await _stream(current_token)
+    
+    # Handle refresh if needed (returns None on 401)
+    if data is None:
+        logger.info("Got 401 in stream, refreshing token...")
+        if await refresh_tokens(state):
+            current_token = state.get("access_token")
+            data = await _stream(current_token)
+            if data is None: # Still 401
+                data = {"reply": "", "error": "Autentifikatsiya eskirgan. Iltimos qayta kiring."}
+        else:
+             data = {"reply": "", "error": "Token yangilanmadi. Iltimos qayta kiring."}
+
+    # Final UI update logic (unchanged)
+    full_text = data.get("reply", "")
     try:
         final_text = full_text if full_text else "Javob olinmadi."
+        if data.get("error") and not full_text:
+             final_text = f"⚠️ {data['error']}"
+
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
@@ -626,17 +660,15 @@ async def stream_chat_response(
             parse_mode=ParseMode.MARKDOWN
         )
     except Exception:
-        # Fallback if Markdown fails
         with contextlib.suppress(Exception):
             await bot.edit_message_text(
                 chat_id=chat_id, 
                 message_id=message_id, 
-                text=full_text,
+                text=final_text, # Use the computed final text
                 parse_mode=None
             )
             
-    result["reply"] = full_text
-    return result
+    return data
 
 
 async def handle_chat(
@@ -672,7 +704,7 @@ async def handle_chat(
             chat_id, 
             status_msg.message_id, 
             payload, 
-            state.get("access_token")
+            state
         )
         
         # If we got a 401 during stream (which is hard to catch mid-stream with httpx), 
