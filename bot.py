@@ -253,6 +253,15 @@ async def ensure_ready(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Di
         # Stop processing current update
         raise RuntimeError("Phone required")
 
+    # Register for notifications (link Chat ID)
+    try:
+        # We use the chat ID as the token for Telegram platform
+        device_payload = {"token": str(update.effective_chat.id), "platform": "telegram"}
+        await api_request("post", "/notifications/device", state, json_body=device_payload)
+    except Exception as exc:
+        # Log but don't fail the flow - notifications are optional
+        logger.warning("Notification registration failed: %s", exc)
+
     return state
 
 
