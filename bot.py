@@ -291,7 +291,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = await ensure_ready(update, context)
+    state = get_state(context)
     contact = update.message.contact
     
     if contact.user_id != update.effective_user.id:
@@ -311,14 +311,32 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "username": update.effective_user.username,
             "phone": phone
         }
-        await api_request("post", "/auth/telegram", state, json_body=payload)
-        await answer(update, "✅ Telefon raqamingiz tasdiqlandi!", markup=get_main_menu())
+        
+        # We use direct request or api_request but MUST capture tokens
+        # /auth/telegram is public, simply posts data
+        data = await api_request("post", "/auth/telegram", state, json_body=payload)
+        
+        # CRITICAL: Save the new tokens
+        state["access_token"] = data["access_token"]
+        state["refresh_token"] = data.get("refresh_token")
+        
+        # Register for notifications immediately
+        try:
+            device_payload = {"token": str(update.effective_chat.id), "platform": "telegram"}
+            await api_request("post", "/notifications/device", state, json_body=device_payload)
+            success_text = "✅ Notifications enabled! You will now receive alerts here."
+        except Exception as exc:
+            logger.warning("Notification registration failed: %s", exc)
+            success_text = "✅ Telefon raqamingiz tasdiqlandi!" # Fallback
+
+        await answer(update, success_text, markup=get_main_menu())
+        
     except Exception as exc:
         logger.exception("Phone update failed: %s", exc)
         await answer(update, "⚠️ Raqamni saqlashda xatolik.")
         return
 
-    # Proceed to main menu
+    # Proceed to main menu logic
     await start(update, context)
 
 
