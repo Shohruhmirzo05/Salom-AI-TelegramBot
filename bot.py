@@ -28,8 +28,6 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     PicklePersistence,
-    MessageHandler,
-    PicklePersistence,
     filters,
 )
 from telegram.error import RetryAfter
@@ -184,6 +182,21 @@ async def api_request(
         raise RuntimeError(f"{resp.status_code}: {resp.text}")
 
     return resp.json() if expect_json else resp
+
+
+def _extract_api_error(exc: Exception) -> str:
+    """Extract human-readable error from API RuntimeError ('status: json_body')."""
+    msg = str(exc)
+    # RuntimeError format: "400: {"detail":"Card tokenization failed: ..."}"
+    if ": " in msg:
+        json_part = msg.split(": ", 1)[1]
+        try:
+            data = json.loads(json_part)
+            if isinstance(data, dict) and "detail" in data:
+                return data["detail"]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return msg
 
 
 # --- UI helpers ------------------------------------------------------------ #
@@ -517,11 +530,15 @@ async def initiate_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, p
     state = await ensure_ready(update, context)
     state["pending_plan_code"] = plan_code
     state["input_mode"] = "card_number"
+
+    cancel_row = [[InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_payment")]]
     await answer(
         update,
-        "💳 Karta raqamingizni kiriting (16 raqam):\n\n"
-        "Masalan: <code>8600123456789012</code>\n\n"
-        "🔒 Ma'lumotlar xavfsiz Click orqali qayta ishlanadi.",
+        "💳 <b>Karta raqamingizni kiriting</b> (16 raqam):\n\n"
+        "Masalan: <code>8600 1234 5678 9012</code>\n\n"
+        "🔒 Ma'lumotlar xavfsiz Click tizimi orqali qayta ishlanadi.\n"
+        "Karta raqami saqlanmaydi.",
+        markup=InlineKeyboardMarkup(cancel_row),
         html_mode=True,
     )
 
@@ -537,7 +554,13 @@ async def handle_card_number(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     state["pending_card_number"] = digits
     state["input_mode"] = "card_expiry"
-    await answer(update, "📅 Amal qilish muddatini kiriting (MMYY):\n\nMasalan: <code>0826</code>", html_mode=True)
+    cancel_row = [[InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_payment")]]
+    await answer(
+        update,
+        "📅 Amal qilish muddatini kiriting (MMYY):\n\nMasalan: <code>0826</code>",
+        markup=InlineKeyboardMarkup(cancel_row),
+        html_mode=True,
+    )
 
 
 async def handle_card_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -577,11 +600,19 @@ async def handle_card_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
     except Exception as exc:
         logger.exception("Tokenize request failed: %s", exc)
+        error_detail = _extract_api_error(exc)
+
+        rows = [
+            [InlineKeyboardButton("🔄 Qayta urinish", callback_data="retry_card")],
+            [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_payment")],
+        ]
         state["input_mode"] = "chat"
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
             message_id=status_msg.message_id,
-            text="⚠️ Karta tokenizatsiyasi amalga oshmadi. Qayta urinib ko'ring.",
+            text=f"⚠️ Xatolik: {html.escape(error_detail)}\n\nBoshqa karta bilan urinib ko'ring yoki bekor qiling.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
         )
 
 
@@ -635,18 +666,29 @@ async def handle_sms_code(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             )
     except Exception as exc:
         logger.exception("SMS verify failed: %s", exc)
+        error_detail = _extract_api_error(exc)
+
+        rows = [
+            [InlineKeyboardButton("🔄 Qayta urinish", callback_data="retry_sms")],
+            [InlineKeyboardButton("💳 Kartani o'zgartirish", callback_data="retry_card")],
+            [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_payment")],
+        ]
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
             message_id=status_msg.message_id,
-            text="⚠️ SMS kod noto'g'ri yoki muddati o'tgan. Qayta urinib ko'ring.",
+            text=f"⚠️ Xatolik: {html.escape(error_detail)}\n\nQuyidagi amallardan birini tanlang:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
         )
-    finally:
-        # Clear pending state
-        state["input_mode"] = "chat"
-        state["pending_card_number"] = None
-        state["pending_request_id"] = None
-        state["pending_phone_hint"] = None
-        state["pending_plan_code"] = None
+        # Don't clear state yet — user might retry
+        return
+
+    # Clear pending state on success or non-retryable outcome
+    state["input_mode"] = "chat"
+    state["pending_card_number"] = None
+    state["pending_request_id"] = None
+    state["pending_phone_hint"] = None
+    state["pending_plan_code"] = None
 
 
 async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -669,11 +711,12 @@ async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     auto_renew = current.get("auto_renew", False)
     card = current.get("saved_card")
 
+    renew_status = "✅ Yoqilgan" if auto_renew else "❌ O'chirilgan"
     text = (
         f"<b>📋 Obuna holati</b>\n\n"
         f"Reja: <b>{html.escape(plan)}</b>\n"
         f"Amal qilish: {html.escape(expires)}\n"
-        f"Avtomatik yangilanish: {'✅ Yoqilgan' if auto_renew else '❌ O\'chirilgan'}\n"
+        f"Avtomatik yangilanish: {renew_status}\n"
     )
     if card:
         text += f"Karta: {html.escape(card.get('masked_number', ''))}\n"
@@ -1152,6 +1195,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as exc:
             logger.warning("Cancel sub failed: %s", exc)
             await answer(update, "⚠️ Xatolik yuz berdi.", markup=get_main_menu())
+    elif data == "cancel_payment":
+        state = await ensure_ready(update, context)
+        state["input_mode"] = "chat"
+        state["pending_card_number"] = None
+        state["pending_request_id"] = None
+        state["pending_phone_hint"] = None
+        state["pending_plan_code"] = None
+        await answer(update, "❌ To'lov bekor qilindi.", markup=get_main_menu())
+    elif data == "retry_sms":
+        state = await ensure_ready(update, context)
+        if state.get("pending_request_id"):
+            state["input_mode"] = "sms_code"
+            phone_hint = state.get("pending_phone_hint", "")
+            hint_text = f" ({phone_hint})" if phone_hint else ""
+            await answer(update, f"📱 SMS kodni qayta kiriting{hint_text}:")
+        else:
+            await answer(update, "⚠️ Sessiya tugadi. Qaytadan boshlang.", markup=get_main_menu())
+    elif data == "retry_card":
+        state = await ensure_ready(update, context)
+        plan_code = state.get("pending_plan_code")
+        if plan_code:
+            state["input_mode"] = "chat"
+            state["pending_card_number"] = None
+            state["pending_request_id"] = None
+            await initiate_payment(update, context, plan_code)
+        else:
+            await answer(update, "⚠️ Sessiya tugadi. Qaytadan boshlang.", markup=get_main_menu())
     elif data == "show_cards":
         await show_saved_cards(update, context)
     elif data.startswith("delete_card:"):
