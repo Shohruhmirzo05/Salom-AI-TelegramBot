@@ -73,8 +73,12 @@ USER_DEFAULTS = {
     "refresh_token": None,
     "conversation_id": None,
     "model": DEFAULT_MODEL,
-    "input_mode": "chat",  # chat | image | set_prompt
+    "input_mode": "chat",  # chat | image | set_prompt | card_number | card_expiry | sms_code | feedback
     "attachments": [],
+    "pending_plan_code": None,
+    "pending_card_number": None,
+    "pending_request_id": None,
+    "pending_phone_hint": None,
 }
 
 
@@ -277,10 +281,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state["attachments"] = []
     await ensure_default_model(state)
 
+    # Handle deep links (e.g., /start payment_123)
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("payment_"):
+            try:
+                payment_id = int(arg.replace("payment_", ""))
+                resp = await api_request("get", f"/subscriptions/payments/{payment_id}", state)
+                status = resp.get("status", "unknown")
+                if status == "paid":
+                    await answer(update, "✅ To'lov muvaffaqiyatli amalga oshdi! Obunangiz faol.", markup=get_main_menu())
+                elif status == "failed":
+                    await answer(update, "❌ To'lov amalga oshmadi. Qayta urinib ko'ring.", markup=get_main_menu())
+                else:
+                    await answer(update, f"⏳ To'lov holati: {status}", markup=get_main_menu())
+                return
+            except Exception as exc:
+                logger.warning("Payment deep link failed: %s", exc)
+
     user = update.effective_user
-    
-    # Phone check is now handled in ensure_ready
-    
+
     name = html.escape(user.first_name or "do'st")
     hello = (
         f"Assalomu alaykum, {name}! 👋\n\n"
@@ -470,43 +490,229 @@ async def handle_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     message_text = "<b>💎 Obuna Rejalari</b>\n\n"
     rows = []
-    
+
     for plan in plans:
         price = f"{plan['price_uzs']:,} UZS" if plan['price_uzs'] > 0 else "Bepul"
         message_text += f"<b>{plan['name']}</b> - {price}\n"
-        
+
         if plan.get('benefits'):
             for benefit in plan['benefits']:
-                # Default to 'uz' since bot seems to be in Uzbek
                 text = benefit.get('uz', benefit.get('en', ''))
                 if text:
                     message_text += f"✅ {text}\n"
         else:
-             message_text += "✅ Imtiyozlar ko'rsatilmagan\n"
-        
+            message_text += "✅ Imtiyozlar ko'rsatilmagan\n"
+
         message_text += "\n"
 
         if plan['price_uzs'] > 0:
             text = f"{plan['name']} - {price}"
             rows.append([InlineKeyboardButton(text, callback_data=f"plan:{plan['code']}")])
-    
+
     await answer(update, message_text, markup=InlineKeyboardMarkup(rows), html_mode=True)
 
 
 async def initiate_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_code: str) -> None:
+    """Start card tokenization flow: ask user for card number."""
+    state = await ensure_ready(update, context)
+    state["pending_plan_code"] = plan_code
+    state["input_mode"] = "card_number"
+    await answer(
+        update,
+        "💳 Karta raqamingizni kiriting (16 raqam):\n\n"
+        "Masalan: <code>8600123456789012</code>\n\n"
+        "🔒 Ma'lumotlar xavfsiz Click orqali qayta ishlanadi.",
+        html_mode=True,
+    )
+
+
+async def handle_card_number(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Process card number input, ask for expiry."""
+    state = get_state(context)
+    digits = text.replace(" ", "").replace("-", "")
+
+    if not digits.isdigit() or len(digits) != 16:
+        await answer(update, "⚠️ Karta raqami 16 ta raqamdan iborat bo'lishi kerak. Qayta kiriting:")
+        return
+
+    state["pending_card_number"] = digits
+    state["input_mode"] = "card_expiry"
+    await answer(update, "📅 Amal qilish muddatini kiriting (MMYY):\n\nMasalan: <code>0826</code>", html_mode=True)
+
+
+async def handle_card_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Process expiry input, call tokenize API, ask for SMS code."""
+    state = get_state(context)
+    digits = text.replace("/", "").replace(" ", "")
+
+    if not digits.isdigit() or len(digits) != 4:
+        await answer(update, "⚠️ Muddat MMYY formatida bo'lishi kerak (masalan: 0826). Qayta kiriting:")
+        return
+
+    card_number = state.get("pending_card_number")
+    if not card_number:
+        state["input_mode"] = "chat"
+        await answer(update, "⚠️ Karta raqami topilmadi. Qaytadan boshlang.", markup=get_main_menu())
+        return
+
+    status_msg = await update.message.reply_text("⏳ Karta tekshirilmoqda...")
+
+    try:
+        resp = await api_request(
+            "post", "/cards/tokenize/request", state,
+            json_body={"card_number": card_number, "expire_date": digits},
+        )
+        request_id = resp.get("request_id")
+        phone_hint = resp.get("phone_hint", "")
+
+        state["pending_request_id"] = request_id
+        state["pending_phone_hint"] = phone_hint
+        state["input_mode"] = "sms_code"
+
+        hint_text = f" ({phone_hint})" if phone_hint else ""
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_msg.message_id,
+            text=f"📱 SMS kod yuborildi{hint_text}.\n\nKodni kiriting:",
+        )
+    except Exception as exc:
+        logger.exception("Tokenize request failed: %s", exc)
+        state["input_mode"] = "chat"
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_msg.message_id,
+            text="⚠️ Karta tokenizatsiyasi amalga oshmadi. Qayta urinib ko'ring.",
+        )
+
+
+async def handle_sms_code(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Process SMS code, verify token, charge first payment."""
+    state = get_state(context)
+    code = text.strip()
+
+    if not code.isdigit():
+        await answer(update, "⚠️ Faqat raqam kiriting:")
+        return
+
+    request_id = state.get("pending_request_id")
+    plan_code = state.get("pending_plan_code")
+
+    if not request_id or not plan_code:
+        state["input_mode"] = "chat"
+        await answer(update, "⚠️ Sessiya tugadi. Qaytadan boshlang.", markup=get_main_menu())
+        return
+
+    status_msg = await update.message.reply_text("⏳ Tasdiqlanmoqda va to'lov amalga oshirilmoqda...")
+
+    try:
+        resp = await api_request(
+            "post", "/cards/tokenize/verify", state,
+            json_body={"request_id": request_id, "sms_code": int(code), "plan_code": plan_code},
+        )
+
+        if resp.get("success"):
+            sub_info = resp.get("subscription", {})
+            plan_name = sub_info.get("plan", plan_code)
+            expires = sub_info.get("expires_at", "")
+
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_msg.message_id,
+                text=(
+                    f"✅ <b>Obuna muvaffaqiyatli faollashtirildi!</b>\n\n"
+                    f"📋 Reja: <b>{html.escape(plan_name)}</b>\n"
+                    f"📅 Amal qilish: {html.escape(expires[:10] if expires else 'N/A')}\n"
+                    f"🔄 Avtomatik yangilanish: Yoqilgan\n\n"
+                    f"Karta saqlandi va har oy avtomatik to'lov amalga oshiriladi."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_msg.message_id,
+                text="⚠️ Tasdiqlash amalga oshmadi. Qayta urinib ko'ring.",
+            )
+    except Exception as exc:
+        logger.exception("SMS verify failed: %s", exc)
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_msg.message_id,
+            text="⚠️ SMS kod noto'g'ri yoki muddati o'tgan. Qayta urinib ko'ring.",
+        )
+    finally:
+        # Clear pending state
+        state["input_mode"] = "chat"
+        state["pending_card_number"] = None
+        state["pending_request_id"] = None
+        state["pending_phone_hint"] = None
+        state["pending_plan_code"] = None
+
+
+async def show_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current subscription status with management options."""
     state = await ensure_ready(update, context)
     try:
-        payload = {"plan": plan_code, "provider": "click"}
-        resp = await api_request("post", "/subscriptions/subscribe", state, json_body=payload)
-        url = resp.get("checkout_url")
-        if url:
-            btn = InlineKeyboardButton("To'lov qilish (Click)", url=url)
-            await answer(update, f"To'lov uchun havolani bosing:", markup=InlineKeyboardMarkup([[btn]]))
-        else:
-            await answer(update, "⚠️ To'lov havolasi olinmadi.")
+        current = await api_request("get", "/subscriptions/current", state)
     except Exception as exc:
-        logger.exception("Payment init failed: %s", exc)
-        await answer(update, "⚠️ To'lovni boshlashda xatolik.")
+        logger.warning("Failed to fetch subscription: %s", exc)
+        await answer(update, "⚠️ Obuna ma'lumotlarini yuklashda xatolik.", markup=get_main_menu())
+        return
+
+    if not current.get("active"):
+        rows = [[InlineKeyboardButton("💎 Obuna sotib olish", callback_data="goto_subscribe")]]
+        await answer(update, "Faol obunangiz yo'q.", markup=InlineKeyboardMarkup(rows))
+        return
+
+    plan = current.get("plan", "Noma'lum")
+    expires = current.get("expires_at", "")[:10] if current.get("expires_at") else "N/A"
+    auto_renew = current.get("auto_renew", False)
+    card = current.get("saved_card")
+
+    text = (
+        f"<b>📋 Obuna holati</b>\n\n"
+        f"Reja: <b>{html.escape(plan)}</b>\n"
+        f"Amal qilish: {html.escape(expires)}\n"
+        f"Avtomatik yangilanish: {'✅ Yoqilgan' if auto_renew else '❌ O\'chirilgan'}\n"
+    )
+    if card:
+        text += f"Karta: {html.escape(card.get('masked_number', ''))}\n"
+
+    rows = []
+    if auto_renew:
+        rows.append([InlineKeyboardButton("🔄 Avtomatik yangilanishni o'chirish", callback_data="toggle_renew:off")])
+    else:
+        rows.append([InlineKeyboardButton("🔄 Avtomatik yangilanishni yoqish", callback_data="toggle_renew:on")])
+    rows.append([InlineKeyboardButton("💳 Saqlangan kartalar", callback_data="show_cards")])
+    rows.append([InlineKeyboardButton("❌ Obunani bekor qilish", callback_data="cancel_sub")])
+
+    await answer(update, text, markup=InlineKeyboardMarkup(rows), html_mode=True)
+
+
+async def show_saved_cards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show user's saved cards with delete option."""
+    state = await ensure_ready(update, context)
+    try:
+        cards = await api_request("get", "/cards", state)
+    except Exception as exc:
+        logger.warning("Failed to fetch cards: %s", exc)
+        await answer(update, "⚠️ Kartalarni yuklashda xatolik.")
+        return
+
+    if not cards:
+        await answer(update, "Saqlangan kartalar yo'q.", markup=get_main_menu())
+        return
+
+    text = "<b>💳 Saqlangan kartalar</b>\n\n"
+    rows = []
+    for card in cards:
+        text += f"• {html.escape(card.get('masked_number', ''))} ({html.escape(card.get('phone_hint', ''))})\n"
+        rows.append([InlineKeyboardButton(
+            f"🗑 {card.get('masked_number', '')} ni o'chirish",
+            callback_data=f"delete_card:{card['id']}",
+        )])
+
+    await answer(update, text, markup=InlineKeyboardMarkup(rows), html_mode=True)
 
 
 async def prompt_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -573,6 +779,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update_system_prompt(update, context, text)
     elif mode == "feedback":
         await submit_feedback(update, context, text)
+    elif mode == "card_number":
+        await handle_card_number(update, context, text)
+    elif mode == "card_expiry":
+        await handle_card_expiry(update, context, text)
+    elif mode == "sms_code":
+        await handle_sms_code(update, context, text)
     else:
         await handle_chat(update, context, text)
 
@@ -914,6 +1126,43 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif data.startswith("plan:"):
         plan_code = data.split(":", 1)[1]
         await initiate_payment(update, context, plan_code)
+    elif data == "goto_subscribe":
+        await handle_subscribe(update, context)
+    elif data.startswith("toggle_renew:"):
+        enabled = data.split(":", 1)[1] == "on"
+        state = await ensure_ready(update, context)
+        try:
+            await api_request("post", "/subscriptions/auto-renew", state, json_body={"enabled": enabled})
+            status = "yoqildi ✅" if enabled else "o'chirildi ❌"
+            await answer(update, f"🔄 Avtomatik yangilanish {status}", markup=get_main_menu())
+        except Exception as exc:
+            logger.warning("Toggle auto-renew failed: %s", exc)
+            await answer(update, "⚠️ Xatolik yuz berdi.", markup=get_main_menu())
+    elif data == "cancel_sub":
+        state = await ensure_ready(update, context)
+        try:
+            resp = await api_request("post", "/subscriptions/cancel", state, json_body={})
+            expires = resp.get("expires_at", "")[:10] if resp.get("expires_at") else ""
+            await answer(
+                update,
+                f"✅ Avtomatik yangilanish o'chirildi.\nObuna {html.escape(expires)} gacha faol qoladi.",
+                markup=get_main_menu(),
+                html_mode=True,
+            )
+        except Exception as exc:
+            logger.warning("Cancel sub failed: %s", exc)
+            await answer(update, "⚠️ Xatolik yuz berdi.", markup=get_main_menu())
+    elif data == "show_cards":
+        await show_saved_cards(update, context)
+    elif data.startswith("delete_card:"):
+        card_id = int(data.split(":", 1)[1])
+        state = await ensure_ready(update, context)
+        try:
+            await api_request("delete", f"/cards/{card_id}", state)
+            await answer(update, "✅ Karta o'chirildi.", markup=get_main_menu())
+        except Exception as exc:
+            logger.warning("Delete card failed: %s", exc)
+            await answer(update, "⚠️ Kartani o'chirishda xatolik.", markup=get_main_menu())
     else:
         await answer(update, "⚠️ Buyruq tanilmadi.", markup=get_main_menu())
 
@@ -923,6 +1172,8 @@ async def post_init(application: Application) -> None:
     commands = [
         ("start", "Botni ishga tushirish"),
         ("menu", "Asosiy menyu"),
+        ("subscription", "Obuna holati"),
+        ("cards", "Saqlangan kartalar"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -939,7 +1190,9 @@ def main() -> None:
 
     # Commands
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("menu", start)) # Menu command redirects to start/main menu
+    application.add_handler(CommandHandler("menu", start))
+    application.add_handler(CommandHandler("subscription", show_subscription))
+    application.add_handler(CommandHandler("cards", show_saved_cards))
 
     # Callbacks
     application.add_handler(CallbackQueryHandler(on_callback))
