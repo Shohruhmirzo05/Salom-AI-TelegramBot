@@ -193,10 +193,29 @@ def _extract_api_error(exc: Exception) -> str:
         try:
             data = json.loads(json_part)
             if isinstance(data, dict) and "detail" in data:
-                return data["detail"]
+                detail = data["detail"]
+                if isinstance(detail, dict):
+                    return detail.get("message", str(detail))
+                return detail
         except (json.JSONDecodeError, ValueError):
             pass
     return msg
+
+
+def _is_limit_exceeded(exc: Exception) -> bool:
+    """Check if an API error is a LIMIT_EXCEEDED response."""
+    msg = str(exc)
+    if ": " in msg:
+        json_part = msg.split(": ", 1)[1]
+        try:
+            data = json.loads(json_part)
+            if isinstance(data, dict):
+                detail = data.get("detail")
+                if isinstance(detail, dict) and detail.get("code") == "LIMIT_EXCEEDED":
+                    return True
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return False
 
 
 # --- UI helpers ------------------------------------------------------------ #
@@ -858,8 +877,21 @@ async def stream_chat_response(
                         return None # Signal need to refresh
 
                     if response.status_code != 200:
-                        error_msg = await response.read()
-                        result["error"] = f"HTTP {response.status_code}: {error_msg.decode('utf-8')}"
+                        error_body = await response.read()
+                        error_text = error_body.decode('utf-8')
+                        # Try to parse structured error
+                        try:
+                            err_data = json.loads(error_text)
+                            detail = err_data.get("detail")
+                            if isinstance(detail, dict) and detail.get("code") == "LIMIT_EXCEEDED":
+                                result["error"] = detail.get("message", error_text)
+                                result["limit_exceeded"] = True
+                                return result
+                            elif isinstance(detail, str):
+                                error_text = detail
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        result["error"] = f"HTTP {response.status_code}: {error_text}"
                         return result
 
                     async for line in response.aiter_lines():
@@ -994,11 +1026,32 @@ async def handle_chat(
         # Ideally, stream_chat_response could return a specific error code.
         
         if data.get("error"):
-            await answer(update, f"⚠️ Xatolik: {data['error']}")
+            error_text = data['error']
+            # Check if the error contains LIMIT_EXCEEDED indicators
+            if data.get("limit_exceeded") or "LIMIT_EXCEEDED" in error_text or "limitga yetdingiz" in error_text:
+                rows = [[InlineKeyboardButton("💎 Obunani yangilash", callback_data="goto_subscribe")]]
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id,
+                    text=f"⚠️ {error_text}\n\nObunangizni yangilang:",
+                    reply_markup=InlineKeyboardMarkup(rows),
+                )
+                return None
+            await answer(update, f"⚠️ Xatolik: {error_text}")
             return None
 
     except Exception as exc:
         logger.exception("Chat error: %s", exc)
+        if _is_limit_exceeded(exc):
+            error_detail = _extract_api_error(exc)
+            rows = [[InlineKeyboardButton("💎 Obunani yangilash", callback_data="goto_subscribe")]]
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_msg.message_id,
+                text=f"⚠️ {error_detail}\n\nObunangizni yangilang:",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return None
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=status_msg.message_id,
@@ -1027,7 +1080,12 @@ async def generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE, pro
             await answer(update, "⚠️ Rasm URL olinmadi.")
     except Exception as exc:
         logger.exception("Image generation error: %s", exc)
-        await answer(update, "⚠️ Rasm yaratishda xatolik.")
+        if _is_limit_exceeded(exc):
+            error_detail = _extract_api_error(exc)
+            rows = [[InlineKeyboardButton("💎 Obunani yangilash", callback_data="goto_subscribe")]]
+            await answer(update, f"⚠️ {error_detail}\n\nObunangizni yangilang:", markup=InlineKeyboardMarkup(rows))
+        else:
+            await answer(update, "⚠️ Rasm yaratishda xatolik.")
         return
     finally:
         state["input_mode"] = "chat"
