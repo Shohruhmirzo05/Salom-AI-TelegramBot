@@ -323,8 +323,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 status = resp.get("status", "unknown")
                 if status == "paid":
                     await answer(update, "✅ To'lov muvaffaqiyatli amalga oshdi! Obunangiz faol.", markup=get_main_menu())
-                elif status == "failed":
-                    await answer(update, "❌ To'lov amalga oshmadi. Qayta urinib ko'ring.", markup=get_main_menu())
+                elif status in {"failed", "cancelled"}:
+                    await answer(update, "❌ To'lov amalga oshmadi yoki muddati tugadi. Qayta urinib ko'ring.", markup=get_main_menu())
                 else:
                     await answer(update, f"⏳ To'lov holati: {status}", markup=get_main_menu())
                 return
@@ -542,6 +542,62 @@ async def handle_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             rows.append([InlineKeyboardButton(text, callback_data=f"plan:{plan['code']}")])
 
     await answer(update, message_text, markup=InlineKeyboardMarkup(rows), html_mode=True)
+
+
+async def choose_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_code: str) -> None:
+    """Let the user choose one-time Click checkout or saved-card auto-renew."""
+    state = await ensure_ready(update, context)
+    state["pending_plan_code"] = plan_code
+    state["input_mode"] = "chat"
+    rows = [
+        [InlineKeyboardButton("💳 Bir martalik to'lov", callback_data=f"pay_once:{plan_code}")],
+        [InlineKeyboardButton("🔄 Avtomatik yangilanish", callback_data=f"pay_auto:{plan_code}")],
+        [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_payment")],
+    ]
+    await answer(
+        update,
+        "💎 <b>To'lov turini tanlang</b>\n\n"
+        "💳 <b>Bir martalik</b> — Click sahifasida to'laysiz, karta saqlanmaydi.\n"
+        "🔄 <b>Avtomatik yangilanish</b> — karta Click orqali saqlanadi va obuna o'zi yangilanadi.",
+        markup=InlineKeyboardMarkup(rows),
+        html_mode=True,
+    )
+
+
+async def initiate_one_time_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_code: str) -> None:
+    """Create a Click checkout URL for a one-time Telegram payment."""
+    state = await ensure_ready(update, context)
+    state["input_mode"] = "chat"
+    state["pending_plan_code"] = plan_code
+    try:
+        resp = await api_request(
+            "post",
+            "/subscriptions/subscribe",
+            state,
+            json_body={"plan": plan_code, "provider": "click", "platform": "telegram"},
+        )
+    except Exception as exc:
+        logger.warning("Failed to create Click checkout: %s", exc)
+        await answer(update, "⚠️ To'lov havolasini yaratib bo'lmadi. Qayta urinib ko'ring.", markup=get_main_menu())
+        return
+
+    checkout_url = resp.get("checkout_url")
+    if not checkout_url:
+        await answer(update, "⚠️ Click havolasi topilmadi. Qayta urinib ko'ring.", markup=get_main_menu())
+        return
+
+    rows = [
+        [InlineKeyboardButton("💳 Click orqali to'lash", url=checkout_url)],
+        [InlineKeyboardButton("🔄 Avtomatik yangilanishni tanlash", callback_data=f"pay_auto:{plan_code}")],
+    ]
+    await answer(
+        update,
+        "✅ <b>To'lov havolasi tayyor</b>\n\n"
+        "Havola 15 daqiqa amal qiladi. Vaqti tugasa, yangi havola yarating.\n"
+        "To'lovdan keyin botga qaytasiz va obuna holati tekshiriladi.",
+        markup=InlineKeyboardMarkup(rows),
+        html_mode=True,
+    )
 
 
 async def initiate_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_code: str) -> None:
@@ -1225,6 +1281,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         state["model"] = model_id
         await answer(update, f"✅ Model tanlandi: {html.escape(model_id)}", markup=get_main_menu())
     elif data.startswith("plan:"):
+        plan_code = data.split(":", 1)[1]
+        await choose_payment_method(update, context, plan_code)
+    elif data.startswith("pay_once:"):
+        plan_code = data.split(":", 1)[1]
+        await initiate_one_time_payment(update, context, plan_code)
+    elif data.startswith("pay_auto:"):
         plan_code = data.split(":", 1)[1]
         await initiate_payment(update, context, plan_code)
     elif data == "goto_subscribe":
