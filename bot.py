@@ -18,6 +18,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
+    WebAppInfo,
 )
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
@@ -38,6 +39,9 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
+# Telegram Mini App: full salom-ai.uz experience opened inside Telegram with
+# silent login (the web app posts initData → backend /auth/telegram/webapp).
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://salom-ai.uz")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "bot_state.pickle")
 
@@ -65,6 +69,7 @@ BTN_USAGE = "📊 Statistika"
 BTN_SUBSCRIBE = "💎 Premium Obuna"
 BTN_FEEDBACK = "📩 Fikr-mulohaza"
 BTN_HELP = "❓ Yordam"
+BTN_WEBAPP = "🚀 Ilovani ochish"
 
 USER_DEFAULTS = {
     "access_token": None,
@@ -220,7 +225,10 @@ def _is_limit_exceeded(exc: Exception) -> bool:
 
 # --- UI helpers ------------------------------------------------------------ #
 def get_main_menu() -> ReplyKeyboardMarkup:
+    # First row opens the full Salom AI Mini App (presentations, files, images,
+    # voice — the whole web app) right inside Telegram, with silent login.
     keyboard = [
+        [KeyboardButton(BTN_WEBAPP, web_app=WebAppInfo(url=WEBAPP_URL))],
         [KeyboardButton(BTN_NEW_CHAT), KeyboardButton(BTN_IMAGE)],
         [KeyboardButton(BTN_HISTORY), KeyboardButton(BTN_MODEL)],
         [KeyboardButton(BTN_SETTINGS), KeyboardButton(BTN_SUBSCRIBE)],
@@ -337,7 +345,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     hello = (
         f"Assalomu alaykum, {name}! 👋\n\n"
         "Men <b>Salom AI</b> telegram yordamchisiman.\n"
-        "Matn, ovoz va rasm yaratish uchun quyidagi menyudan foydalaning."
+        "Matn, ovoz va rasm yaratish uchun quyidagi menyudan foydalaning.\n\n"
+        "🚀 To'liq imkoniyatlar (taqdimot, fayl tahlili, ovozli suhbat) uchun "
+        "<b>«Ilovani ochish»</b> tugmasini bosing."
     )
     await answer(update, hello, markup=get_main_menu(), html_mode=True)
 
