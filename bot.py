@@ -237,6 +237,11 @@ def get_main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
 
+def webapp_inline_kb(label: str = "🚀 Ilovani ochish") -> InlineKeyboardMarkup:
+    """Inline button that opens the full Salom AI Mini App (web) inside Telegram."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, web_app=WebAppInfo(url=WEBAPP_URL))]])
+
+
 async def answer(
     update: Update,
     text: str,
@@ -1128,9 +1133,37 @@ async def handle_chat(
     state["conversation_id"] = data.get("conversation_id")
     state["input_mode"] = "chat"
     state["attachments"] = []
-    
+
+    # Gently nudge users toward the richer Mini App every few messages.
+    try:
+        n = int(state.get("msgs_since_nudge", 0)) + 1
+        if n >= 4:
+            state["msgs_since_nudge"] = 0
+            await context.bot.send_message(
+                chat_id,
+                "✨ <b>Salom AI ilovasi</b>da ko‘proq imkoniyat bor: taqdimot, referat, "
+                "fayl tahlili, ovozli suhbat va DTM mashqlari — qulayroq va tezkor.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=webapp_inline_kb("🚀 Ilovada ochish"),
+            )
+        else:
+            state["msgs_since_nudge"] = n
+    except Exception:
+        pass
+
     reply_text = data.get("reply", "")
     return reply_text if return_reply else None
+
+
+async def open_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/app — quick entry to the full Salom AI Mini App."""
+    await update.message.reply_text(
+        "🚀 <b>Salom AI ilovasi</b> — barcha imkoniyatlar bir joyda:\n"
+        "• AI taqdimot va referat\n• Fayl va rasm tahlili\n• Ovozli suhbat\n• DTM mashqlari\n\n"
+        "Pastdagi tugmani bosing 👇",
+        parse_mode=ParseMode.HTML,
+        reply_markup=webapp_inline_kb("🚀 Ilovani ochish"),
+    )
 
 
 async def generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
@@ -1391,6 +1424,7 @@ def main() -> None:
     # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", start))
+    application.add_handler(CommandHandler("app", open_app))
     application.add_handler(CommandHandler("subscription", show_subscription))
     application.add_handler(CommandHandler("cards", show_saved_cards))
 
