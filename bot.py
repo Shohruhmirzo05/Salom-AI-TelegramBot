@@ -242,6 +242,26 @@ def webapp_inline_kb(label: str = "🚀 Ilovani ochish") -> InlineKeyboardMarkup
     return InlineKeyboardMarkup([[InlineKeyboardButton(label, web_app=WebAppInfo(url=WEBAPP_URL))]])
 
 
+async def _track_event(state: Dict[str, Any], name: str, props: Optional[dict] = None) -> None:
+    """Send a product-analytics event to the backend (attributed to this user via
+    their token). Feeds the same admin funnel as web/iOS. Never raises."""
+    try:
+        await api_request("post", "/events", state, json_body={
+            "events": [{"name": name, "platform": "telegram", "props": props}],
+            "platform": "telegram",
+        })
+    except Exception:
+        pass
+
+
+def fire(state: Dict[str, Any], name: str, props: Optional[dict] = None) -> None:
+    """Fire-and-forget analytics — never blocks the user's flow."""
+    try:
+        asyncio.create_task(_track_event(state, name, props))
+    except Exception:
+        pass
+
+
 async def answer(
     update: Update,
     text: str,
@@ -325,6 +345,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state["conversation_id"] = None
     state["attachments"] = []
     await ensure_default_model(state)
+    fire(state, "feature_opened", {"feature": "telegram_bot"})
 
     # Handle deep links (e.g., /start payment_123)
     if context.args:
@@ -1133,6 +1154,7 @@ async def handle_chat(
     state["conversation_id"] = data.get("conversation_id")
     state["input_mode"] = "chat"
     state["attachments"] = []
+    fire(state, "chat_message", {"model": state.get("model")})
 
     # Gently nudge users toward the richer Mini App every few messages.
     try:
@@ -1325,14 +1347,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await answer(update, f"✅ Model tanlandi: {html.escape(model_id)}", markup=get_main_menu())
     elif data.startswith("plan:"):
         plan_code = data.split(":", 1)[1]
+        fire(get_state(context), "paywall_plan_clicked", {"plan": plan_code})
         await choose_payment_method(update, context, plan_code)
     elif data.startswith("pay_once:"):
         plan_code = data.split(":", 1)[1]
+        fire(get_state(context), "payment_started", {"plan": plan_code, "type": "one_time"})
         await initiate_one_time_payment(update, context, plan_code)
     elif data.startswith("pay_auto:"):
         plan_code = data.split(":", 1)[1]
+        fire(get_state(context), "payment_started", {"plan": plan_code, "type": "auto"})
         await initiate_payment(update, context, plan_code)
     elif data == "goto_subscribe":
+        fire(get_state(context), "paywall_shown", {"context": "bot"})
         await handle_subscribe(update, context)
     elif data.startswith("toggle_renew:"):
         enabled = data.split(":", 1)[1] == "on"
