@@ -969,13 +969,16 @@ async def stream_chat_response(
                         return None # Signal need to refresh
 
                     if response.status_code != 200:
-                        error_body = await response.read()
+                        # MUST use aread() on an async streaming response — read()
+                        # raises "Attempted to call a sync iterator on an async
+                        # stream", which previously crashed the limit (403) path.
+                        error_body = await response.aread()
                         error_text = error_body.decode('utf-8')
                         # Try to parse structured error
                         try:
                             err_data = json.loads(error_text)
                             detail = err_data.get("detail")
-                            if isinstance(detail, dict) and detail.get("code") == "LIMIT_EXCEEDED":
+                            if isinstance(detail, dict) and detail.get("code") in ("LIMIT_EXCEEDED", "FREE_DAILY_REACHED"):
                                 result["error"] = detail.get("message", error_text)
                                 result["limit_exceeded"] = True
                                 return result
@@ -1225,7 +1228,9 @@ async def update_system_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # --- Attachments ----------------------------------------------------------- #
-async def upload_file_to_backend(state: Dict[str, Any], file_path: str, file_name: str, mime: str) -> Optional[str]:
+async def upload_file_to_backend(state: Dict[str, Any], file_path: str, file_name: str, mime: str) -> Dict[str, Any]:
+    """Upload a file. Returns {"url": ...} on success, {"limit": True, "message": ...}
+    when the plan limit is hit (so callers can prompt an upgrade), or {"error": ...}."""
     def _request(token: str):
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         with open(file_path, "rb") as f:
@@ -1242,13 +1247,34 @@ async def upload_file_to_backend(state: Dict[str, Any], file_path: str, file_nam
     if resp.status_code == 401 and await refresh_tokens(state):
         resp = await asyncio.to_thread(_request, state.get("access_token"))
 
-    if not resp.ok:
-        logger.warning("File upload failed: %s", resp.text)
-        return None
-    try:
-        return resp.json().get("url")
-    except Exception:
-        return None
+    if resp.ok:
+        try:
+            url = resp.json().get("url")
+            return {"url": url} if url else {"error": "no_url"}
+        except Exception:
+            return {"error": "bad_response"}
+
+    # Limit hit → let the caller convert (upgrade prompt) instead of a dead error.
+    if resp.status_code == 403:
+        try:
+            detail = resp.json().get("detail")
+            if isinstance(detail, dict) and detail.get("code") in ("LIMIT_EXCEEDED", "FREE_DAILY_REACHED"):
+                return {"limit": True, "message": detail.get("message")}
+        except Exception:
+            pass
+
+    logger.warning("File upload failed: HTTP %s — %s", resp.status_code, (resp.text or "")[:300])
+    return {"error": f"HTTP {resp.status_code}"}
+
+
+async def _send_upgrade_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, message: Optional[str]) -> None:
+    """Show a clean upgrade CTA when a file/limit is hit — convert, don't dead-end."""
+    rows = [[InlineKeyboardButton("💎 Obunani yangilash", callback_data="goto_subscribe")]]
+    await context.bot.send_message(
+        update.effective_chat.id,
+        f"📎 {message or 'Fayl tahlili limiti tugadi.'}\n\nFayllarni cheksiz tahlil qilish uchun Pro tarifiga o'ting:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1257,12 +1283,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(photo.file_id)
     with tempfile.NamedTemporaryFile(delete=True, suffix=".jpg") as tmp:
         await file.download_to_drive(tmp.name)
-        url = await upload_file_to_backend(state, tmp.name, os.path.basename(tmp.name), "image/jpeg")
-    if url:
-        state.setdefault("attachments", []).append(url)
+        res = await upload_file_to_backend(state, tmp.name, os.path.basename(tmp.name), "image/jpeg")
+    if res.get("url"):
+        state.setdefault("attachments", []).append(res["url"])
         await answer(update, "📎 Rasm biriktirildi. Matn yuboring.", markup=get_main_menu())
+    elif res.get("limit"):
+        await _send_upgrade_prompt(update, context, res.get("message"))
     else:
-        await answer(update, "⚠️ Rasm yuklanmadi.")
+        await answer(update, "⚠️ Rasm yuklanmadi. Birozdan so'ng qayta urinib ko'ring.")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1272,17 +1300,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     suffix = os.path.splitext(doc.file_name or "file")[1] or ".dat"
     with tempfile.NamedTemporaryFile(delete=True, suffix=suffix) as tmp:
         await file.download_to_drive(tmp.name)
-        url = await upload_file_to_backend(
+        res = await upload_file_to_backend(
             state,
             tmp.name,
             doc.file_name or os.path.basename(tmp.name),
             doc.mime_type or "application/octet-stream",
         )
-    if url:
-        state.setdefault("attachments", []).append(url)
+    if res.get("url"):
+        state.setdefault("attachments", []).append(res["url"])
         await answer(update, "📎 Fayl biriktirildi. Matn yuboring.", markup=get_main_menu())
+    elif res.get("limit"):
+        await _send_upgrade_prompt(update, context, res.get("message"))
     else:
-        await answer(update, "⚠️ Fayl yuklanmadi.")
+        await answer(update, "⚠️ Fayl yuklanmadi. Birozdan so'ng qayta urinib ko'ring.")
 
 
 # --- Voice ---------------------------------------------------------------- #
