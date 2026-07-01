@@ -1370,22 +1370,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     with tempfile.NamedTemporaryFile(delete=True, suffix=".ogg") as tmp:
         await tg_file.download_to_drive(tmp.name)
         try:
-            # 1) STT
+            # 1) STT (OpenAI, Uzbek-first). The /voice/stt endpoint enforces the
+            #    user's voice-minutes limit server-side and returns 403 if exceeded.
             with open(tmp.name, "rb") as f:
                 files = {"file": ("voice.ogg", f, "audio/ogg")}
-                stt_resp = await api_request("post", "/stt", state, files=files)
-            transcript = stt_resp.get("text", "")
+                stt_resp = await api_request("post", "/voice/stt", state, files=files)
+            transcript = (stt_resp.get("text") or "").strip()
+            if not transcript:
+                await update.message.reply_text("🎤 Ovoz aniqlanmadi, qayta urinib ko‘ring.")
+                return
             await update.message.reply_text(f"🎤 {transcript}")
 
-            # 2) Chat
+            # 2) Chat (enforces the message limit server-side)
             reply_text = await handle_chat(update, context, transcript, return_reply=True)
 
-            # 3) TTS reply
+            # 3) TTS reply (best-effort — voice output is a bonus)
             if reply_text:
                 try:
                     tts_resp = await api_request(
                         "post",
-                        "/tts",
+                        "/voice/tts",
                         state,
                         json_body={"text": reply_text},
                         expect_json=False,
@@ -1399,7 +1403,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     logger.warning("TTS failed: %s", tts_exc)
         except Exception as exc:
             logger.exception("Voice handling failed: %s", exc)
-            await answer(update, "⚠️ Ovozli xabarni qayta ishlashda xatolik.")
+            # Surface friendly errors (e.g. rate-limit reached) instead of a generic one.
+            friendly = _extract_api_error(exc)
+            low = friendly.lower()
+            if any(w in low for w in ("limit", "tugadi", "yetdingiz", "tiklanadi")):
+                await answer(update, f"⚠️ {friendly}")
+            else:
+                await answer(update, "⚠️ Ovozli xabarni qayta ishlashda xatolik. Qaytadan urinib ko‘ring.")
 
 
 # --- Callback routing ------------------------------------------------------ #
